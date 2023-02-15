@@ -54,18 +54,26 @@ function BaseProjectile.New(projectileId, OriginPosition, Velocity, resolverFunc
 		Destroyed = false,
 	}, BaseProjectile)
 
+	table.insert(ActiveProjectileClasses, self)
+
 	return self
 end
 
+function BaseProjectile:Update(deltaTime)
+
+end
+
 -- // Module // --
-local Module = { GLOBAL_TIME_SCALE = 1 }
+local Module = {}
 
 function Module:IsActorId(actorId)
 	return ActorInstance.Name == actorId
 end
 
 function Module:CreateProjectile(projectileId, origin, velocity, resolverFunction)
+	local projectileClass = BaseProjectile.New(projectileId, origin, velocity, resolverFunction)
 
+	return projectileClass.projectileId
 end
 
 function Module:Start()
