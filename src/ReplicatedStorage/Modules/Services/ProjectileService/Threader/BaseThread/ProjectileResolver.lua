@@ -1,14 +1,18 @@
 local RunService = game:GetService('RunService')
 
 local ActorInstance = script.Parent
-local ActorId = ActorInstance.Name
+--local ActorId = ActorInstance.Name
 
 local ReplicatedStorage = game:GetService('ReplicatedStorage')
 local VisualizersModule = require(ReplicatedStorage:WaitForChild('Modules'):WaitForChild('Utility'):WaitForChild('Visualizers'))
 
-local CreateProjectileEvent = ActorInstance.CreateProjectile.Value
-local ProjectileUpdateEvent = ActorInstance.UpdateEvent.Value
-local ThreaderFunctionRequest = ActorInstance.ThreaderRequest.Value
+local GetRemoteFunction = require(script.Parent.RemoteModule.Value)
+
+local CreateProjectileEvent = GetRemoteFunction('CreateProjectileEvent', 'BindableEvent')
+local ProjectileUpdateEvent = GetRemoteFunction('ProjectileUpdateEvent', 'BindableEvent')
+local ResolveFunctionResponse = GetRemoteFunction('ResolveFunctionResponse', 'BindableFunction')
+local SharedFunctionCall = GetRemoteFunction('SharedFunctionCallEvent', 'BindableEvent')
+
 local function ResolveFunctionFromHost(func, ...)
 	local _, err = pcall(func)
 	-- if it is not a function from a different vm, run normally.
@@ -16,13 +20,11 @@ local function ResolveFunctionFromHost(func, ...)
 		return func(...)
 	end
 	-- otherwise request threader for function return
-	return ThreaderFunctionRequest:Invoke(func, ...)
+	return ResolveFunctionResponse:Invoke(func, ...)
 end
 
-local STEP_ITERATIONS = 6
 local GLOBAL_TIME_SCALE = 0.8
 local GLOBAL_ACCELERATION = -Vector3.new( 0, workspace.Gravity * 0.15, 0 )
-local ActiveProjectileClasses = {}
 
 local NEGATIVE_RAY_EPSILON_LENGTH = 0.1
 local MAX_NEGATIVE_RAY_THREASHOLD = 20
@@ -40,9 +42,12 @@ local MaterialPenetrationCostMatrix = {
 	[Enum.Material.Plastic] = 7,
 }
 
+local ActiveProjectileClasses = {}
+local ProjectileIdClassCache = {}
+
 -- // Miscellaneous Functions // --
 -- return a different value; 0=keep going, 1=penetrate, 2=reflect, 3=stop
-local function DefaultOnRayHit( projectileData )
+local function DefaultOnRayHit( _ ) -- projectileData
 	return 3 -- stop on hit by default
 end
 
@@ -93,7 +98,7 @@ function BaseProjectile.New(projectileId, OriginPosition, Velocity, resolverFunc
 		Acceleration = Vector3.new(),
 		LastRaycastValue = false,
 
-		OnRayHit = resolverFunction or DefaultOnRayHit,
+		OnRayHitResolver = resolverFunction or DefaultOnRayHit,
 
 		_initPosition = OriginPosition,
 		_initVelocity = Velocity,
@@ -107,9 +112,54 @@ function BaseProjectile.New(projectileId, OriginPosition, Velocity, resolverFunc
 		Destroyed = false,
 	}, BaseProjectile)
 
-	table.insert(ActiveProjectileClasses, self)
-
 	return self
+end
+
+function BaseProjectile:IsDestroyed()
+	return self.Destroyed
+end
+
+function BaseProjectile:SetActive( isActive )
+	self.Active = (isActive==true)
+	if self.Active then
+		self:AddToGlobalResolver()
+	else
+		self:RemoveFromGlobalResolver()
+	end
+end
+
+function BaseProjectile:AddAccelerate( acceleration : Vector3 )
+	self.Acceleration += acceleration
+end
+
+function BaseProjectile:SetAcceleration( acceleration : Vector3 )
+	self.Acceleration = acceleration
+end
+
+function BaseProjectile:Destroy()
+	self.Destroyed = true
+	ProjectileUpdateEvent:Fire(self.projectileId, 'OnTerminateEvent', self)
+end
+
+function BaseProjectile:IsInGlobalResolver()
+	-- returns the index of the projectile in the global resolver
+	-- if it is not within the global resolver, returns nil
+	return table.find(ActiveProjectileClasses, self)
+end
+
+function BaseProjectile:AddToGlobalResolver()
+	if not self:IsInGlobalResolver() then
+		table.insert(ActiveProjectileClasses, self)
+	end
+end
+
+function BaseProjectile:RemoveFromGlobalResolver()
+	-- remove all occurances of this projectile
+	local index = table.find(ActiveProjectileClasses, self)
+	while index do
+		table.remove(ActiveProjectileClasses, index)
+		index = table.find(ActiveProjectileClasses, self)
+	end
 end
 
 function BaseProjectile:Update(deltaTime)
@@ -150,7 +200,10 @@ function BaseProjectile:Update(deltaTime)
 	end
 	self.LastRaycastValue = raycastResult
 
-	local onRayHitJob = raycastResult and (self.OnRayHit and self.OnRayHit( self, raycastResult )) or 0
+	local onRayHitJob = 0
+	if raycastResult and self.OnRayHitResolver then
+		onRayHitJob = ResolveFunctionFromHost(self.OnRayHitResolver, self, raycastResult)
+	end
 
 	local killProjectile = false
 
@@ -193,6 +246,10 @@ function BaseProjectile:Update(deltaTime)
 		killProjectile = true
 	end
 
+	if raycastResult then
+		ProjectileUpdateEvent:Fire(self.projectileId, 'OnHitEvent', raycastResult, onRayHitJob)
+	end
+
 	local stepData = {
 		DeltaTime = deltaTime,
 		RayHitJob = onRayHitJob,
@@ -206,10 +263,8 @@ function BaseProjectile:Update(deltaTime)
 	if self.DebugData then
 		table.insert(self.DebugSteps, stepData)
 	end
-	if self.OnRayUpdated then
-		ProjectileUpdateEvent:Fire(self.projectileId, stepData)
-		task.spawn(self.OnRayUpdated, self, stepData)
-	end
+
+	ProjectileUpdateEvent:Fire(self.projectileId, 'OnPhysicsStepEvent', stepData)
 
 	if killProjectile then
 		self:Destroy()
@@ -220,51 +275,95 @@ end
 local Module = {}
 
 function Module:IsActorId(actorId)
-	return ActorInstance.Name == actorId
+	return (ActorInstance.Name == actorId)
+end
+
+function Module:SetGlobalAcceleration( accelerationVector )
+	GLOBAL_ACCELERATION = accelerationVector
+end
+
+function Module:SetGlobalTimeScale( newTimeScale )
+	GLOBAL_TIME_SCALE = newTimeScale
 end
 
 function Module:CreateProjectile(projectileId, origin, velocity, resolverFunction)
+	print('new projectile - ', projectileId)
 	local projectileClass = BaseProjectile.New(projectileId, origin, velocity, resolverFunction)
 
-	return projectileClass.projectileId
+	table.insert(ActiveProjectileClasses, projectileClass)
+	ProjectileIdClassCache[projectileId] = projectileClass
 end
 
 function Module:Start()
+	print('started threader')
 
 	CreateProjectileEvent.Event:Connect(function(actorId, projectileId, origin, velocity, resolverFunction)
+		print('got create projectile signal')
 		if not Module:IsActorId(actorId) then
 			return
 		end
+		print(actorId, projectileId, origin, velocity)
 		Module:CreateProjectile(projectileId, origin, velocity, resolverFunction)
 	end)
 
+	SharedFunctionCall.Event:Connect(function(functionName, ...)
+		print('got shared func calll; ', functionName, ...)
+		if Module[functionName] then
+			Module[functionName](Module, ...)
+		end
+	end)
+
+	--local EventSignalPropertyList = {'OnHitEvent', 'OnPhysicsStepEvent', 'OnTerminateEvent'}
+	local EditablePropertyList = {'Active', 'Destroyed', 'RaycastParams', 'OnRayHitResolver'}
+	ProjectileUpdateEvent.Event:Connect(function(projectileId, target, ...)
+		print('got edit property; ', projectileId, target, ...)
+		local projectileData = ProjectileIdClassCache[ projectileId ]
+		if not projectileData then
+			return
+		end
+		--[[if table.find(EventSignalPropertyList, target) then
+			projectileData[target]( projectileData, ... )
+	else]]if table.find(EditablePropertyList, target) then
+			local values = {...}
+			if #values == 0 then
+				return
+			end
+			projectileData[target] = values[1] -- get the first value
+		end
+	end)
+
 	RunService.Heartbeat:ConnectParallel(function(deltaTime)
-		deltaTime *= Module.GLOBAL_TIME_SCALE
+		deltaTime *= GLOBAL_TIME_SCALE
+
+		if #ActiveProjectileClasses > 0 then
+			print(#ActiveProjectileClasses)
+		end
 
 		local index = 1
 		while index <= #ActiveProjectileClasses do
 			local projectileClass = ActiveProjectileClasses[index]
-			if projectileClass:IsDestroyed() or projectileClass.ERRORED then
+			if projectileClass:IsDestroyed() then
 				table.remove(ActiveProjectileClasses, index)
+				ProjectileIdClassCache[ projectileClass.projectileId ] = nil
 			else
 				if not projectileClass.IsUpdating then
 					projectileClass.IsUpdating = true
-					-- synchronize?
 					task.defer(function()
 						projectileClass:Update(deltaTime)
 						projectileClass.IsUpdating = false
 					end)
-					-- desynchronize?
 				end
 				index += 1
 			end
 		end
 	end)
 
+	return Module
 end
 
 function Module:Init()
 
+	return Module
 end
 
 return Module
